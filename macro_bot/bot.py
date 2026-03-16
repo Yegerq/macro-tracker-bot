@@ -15,25 +15,39 @@ from telegram.ext import (
 
 from .config import Settings, load_settings
 from .database import MacroDatabase
-from .formatters import dated_title, format_confirmation, format_number, format_summary
+from .exercises import EXERCISE_CHOICES, get_exercise_label, parse_exercise_name
+from .formatters import (
+    dated_title,
+    format_confirmation,
+    format_exercise_result,
+    format_number,
+    format_pr_summary,
+    format_single_pr,
+    format_summary,
+)
 from .models import ParsedMeal
 from .parser import parse_meal
 
 LOGGER = logging.getLogger(__name__)
 
-CALORIES, PROTEIN, FAT, CARBS, NEXT_MEAL = range(5)
+CALORIES, PROTEIN, FAT, CARBS, NEXT_MEAL, EXERCISE_CHOICE, EXERCISE_WEIGHT = range(7)
 MEAL_DATA_KEY = "pending_meal"
+EXERCISE_DATA_KEY = "pending_exercise"
 NEXT_MEAL_YES = "next_meal_yes"
 NEXT_MEAL_NO = "next_meal_no"
+EXERCISE_CALLBACK_PREFIX = "exercise:"
 
 HELP_TEXT = (
     "После /start или /add бот задаст 4 вопроса подряд:\n"
     "калории, белки, жиры, углеводы.\n\n"
     "После сохранения бот предложит кнопки для следующего приема пищи.\n\n"
+    "Для упражнений используй /exercise, а для просмотра PR используй /pr.\n\n"
     "Можно и старым способом одной строкой:\n"
     "650 ккал, 55 углеводов, 35 белков, 20 жиров\n\n"
     "Команды:\n"
     "/add - добавить прием пищи пошагово\n"
+    "/exercise - записать результат упражнения\n"
+    "/pr - показать PR по упражнениям\n"
     "/today - итог за текущий день\n"
     "/cancel - отменить текущий ввод\n"
     "/help - подсказка"
@@ -90,6 +104,20 @@ def _next_meal_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _exercise_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for exercise_key, label in EXERCISE_CHOICES:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{EXERCISE_CALLBACK_PREFIX}{exercise_key}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 async def _send_saved_meal_response(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
@@ -115,6 +143,7 @@ async def _start_meal_dialog(chat_id: Optional[int], context: ContextTypes.DEFAU
 
     timezone = _get_timezone(context)
     _get_database(context).touch_chat(chat_id, datetime.now(timezone))
+    context.user_data.pop(EXERCISE_DATA_KEY, None)
     context.user_data[MEAL_DATA_KEY] = {}
     await context.bot.send_message(
         chat_id=chat_id,
@@ -122,6 +151,22 @@ async def _start_meal_dialog(chat_id: Optional[int], context: ContextTypes.DEFAU
         "Сколько калорий в этом приеме пищи?",
     )
     return CALORIES
+
+
+async def _start_exercise_dialog(chat_id: Optional[int], context: ContextTypes.DEFAULT_TYPE) -> int:
+    if chat_id is None:
+        return ConversationHandler.END
+
+    timezone = _get_timezone(context)
+    _get_database(context).touch_chat(chat_id, datetime.now(timezone))
+    context.user_data.pop(MEAL_DATA_KEY, None)
+    context.user_data[EXERCISE_DATA_KEY] = {}
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Какое упражнение записать?",
+        reply_markup=_exercise_keyboard(),
+    )
+    return EXERCISE_CHOICE
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -134,10 +179,16 @@ async def add_meal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return await _start_meal_dialog(chat_id, context)
 
 
+async def exercise_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id if update.effective_chat is not None else None
+    return await _start_exercise_dialog(chat_id, context)
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message is not None:
         await update.message.reply_text("Текущий ввод отменен.")
     context.user_data.pop(MEAL_DATA_KEY, None)
+    context.user_data.pop(EXERCISE_DATA_KEY, None)
     return ConversationHandler.END
 
 
@@ -239,6 +290,67 @@ async def next_meal_text_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return NEXT_MEAL
 
 
+async def exercise_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query is None:
+        return ConversationHandler.END
+
+    query = update.callback_query
+    chat_id = update.effective_chat.id if update.effective_chat is not None else None
+    if chat_id is None or query.data is None:
+        return ConversationHandler.END
+
+    await query.answer()
+    exercise_key = query.data.removeprefix(EXERCISE_CALLBACK_PREFIX)
+    context.user_data[EXERCISE_DATA_KEY] = {"exercise_key": exercise_key}
+    await query.edit_message_text(text=f"Упражнение: {get_exercise_label(exercise_key)}")
+    await context.bot.send_message(chat_id=chat_id, text="Сколько килограммов?")
+    return EXERCISE_WEIGHT
+
+
+async def exercise_choice_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or not update.message.text:
+        return EXERCISE_CHOICE
+
+    exercise_key = parse_exercise_name(update.message.text)
+    if exercise_key is None:
+        labels = ", ".join(label for _, label in EXERCISE_CHOICES)
+        await update.message.reply_text(f"Выбери одно из упражнений: {labels}")
+        return EXERCISE_CHOICE
+
+    context.user_data[EXERCISE_DATA_KEY] = {"exercise_key": exercise_key}
+    await update.message.reply_text(
+        f"Упражнение: {get_exercise_label(exercise_key)}\nСколько килограммов?"
+    )
+    return EXERCISE_WEIGHT
+
+
+async def exercise_weight_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_chat is None or update.message is None or not update.message.text:
+        return EXERCISE_WEIGHT
+
+    weight = _parse_number(update.message.text)
+    if weight is None or weight == 0:
+        await update.message.reply_text("Нужно число больше 0. Например: 100")
+        return EXERCISE_WEIGHT
+
+    exercise_data = context.user_data.get(EXERCISE_DATA_KEY, {})
+    exercise_key = exercise_data.get("exercise_key")
+    if not exercise_key:
+        return await _start_exercise_dialog(update.effective_chat.id, context)
+
+    timezone = _get_timezone(context)
+    now = datetime.now(timezone)
+    database = _get_database(context)
+    previous_record = database.get_personal_record(update.effective_chat.id, exercise_key)
+    database.add_exercise_result(update.effective_chat.id, now, exercise_key, weight)
+    context.user_data.pop(EXERCISE_DATA_KEY, None)
+
+    await update.message.reply_text(
+        format_exercise_result(exercise_key, weight, previous_record)
+    )
+    return ConversationHandler.END
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.message is None:
         return
@@ -261,6 +373,30 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(format_summary("Итого за сегодня", totals))
 
 
+async def pr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+
+    timezone = _get_timezone(context)
+    now = datetime.now(timezone)
+    database = _get_database(context)
+    database.touch_chat(update.effective_chat.id, now)
+
+    if context.args:
+        exercise_key = parse_exercise_name(" ".join(context.args))
+        if exercise_key is None:
+            labels = ", ".join(label for _, label in EXERCISE_CHOICES)
+            await update.message.reply_text(f"Не понял упражнение. Доступно: {labels}")
+            return
+
+        record = database.get_personal_record(update.effective_chat.id, exercise_key)
+        await update.message.reply_text(format_single_pr(exercise_key, record))
+        return
+
+    records = database.get_personal_records(update.effective_chat.id)
+    await update.message.reply_text(format_pr_summary(records))
+
+
 async def meal_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.message is None or not update.message.text:
         return
@@ -270,7 +406,8 @@ async def meal_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Не понял сообщение.\n\n"
             "Попробуй так:\n"
-            "650 ккал, 55 углеводов, 35 белков, 20 жиров"
+            "650 ккал, 55 углеводов, 35 белков, 20 жиров\n\n"
+            "Для упражнений используй /exercise, а для просмотра PR используй /pr."
         )
         return
 
@@ -322,10 +459,11 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["db"] = database
     application.bot_data["timezone"] = settings.timezone
 
-    meal_conversation = ConversationHandler(
+    input_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_command),
             CommandHandler("add", add_meal_command),
+            CommandHandler("exercise", exercise_command),
             CallbackQueryHandler(
                 next_meal_callback,
                 pattern=f"^({NEXT_MEAL_YES}|{NEXT_MEAL_NO})$",
@@ -344,12 +482,21 @@ def build_application(settings: Settings) -> Application:
                 ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, next_meal_text_input),
             ],
+            EXERCISE_CHOICE: [
+                CallbackQueryHandler(
+                    exercise_choice_callback,
+                    pattern=f"^{EXERCISE_CALLBACK_PREFIX}.+",
+                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, exercise_choice_text_input),
+            ],
+            EXERCISE_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exercise_weight_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
 
-    application.add_handler(meal_conversation)
+    application.add_handler(input_conversation)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("pr", pr_command))
     application.add_handler(CommandHandler(["today", "summary"], today_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, meal_message))

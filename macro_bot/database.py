@@ -1,9 +1,9 @@
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from .models import DailyTotals, ParsedMeal
+from .models import DailyTotals, ParsedMeal, PersonalRecord
 
 
 class MacroDatabase:
@@ -47,8 +47,20 @@ class MacroDatabase:
                     FOREIGN KEY(chat_id) REFERENCES chats(chat_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS exercise_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    exercise_key TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    logged_at TEXT NOT NULL,
+                    FOREIGN KEY(chat_id) REFERENCES chats(chat_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_meals_chat_date
                 ON meals (chat_id, logged_date);
+
+                CREATE INDEX IF NOT EXISTS idx_exercise_records_chat_exercise
+                ON exercise_records (chat_id, exercise_key);
                 """
             )
 
@@ -102,6 +114,36 @@ class MacroDatabase:
                 ),
             )
 
+    def add_exercise_result(
+        self,
+        chat_id: int,
+        logged_at: datetime,
+        exercise_key: str,
+        weight: float,
+    ) -> None:
+        logged_at_value = logged_at.isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chats (chat_id, first_seen, last_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET last_seen = excluded.last_seen
+                """,
+                (chat_id, logged_at_value, logged_at_value),
+            )
+            connection.execute(
+                """
+                INSERT INTO exercise_records (
+                    chat_id,
+                    exercise_key,
+                    weight,
+                    logged_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, exercise_key, weight, logged_at_value),
+            )
+
     def get_daily_totals(self, chat_id: int, logged_date: date) -> DailyTotals:
         with self._connect() as connection:
             row = connection.execute(
@@ -131,6 +173,50 @@ class MacroDatabase:
         with self._connect() as connection:
             rows = connection.execute("SELECT chat_id FROM chats ORDER BY chat_id").fetchall()
         return [int(row["chat_id"]) for row in rows]
+
+    def get_personal_record(self, chat_id: int, exercise_key: str) -> Optional[PersonalRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT exercise_key, weight, logged_at
+                FROM exercise_records
+                WHERE chat_id = ? AND exercise_key = ?
+                ORDER BY weight DESC, logged_at DESC
+                LIMIT 1
+                """,
+                (chat_id, exercise_key),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return PersonalRecord(
+            exercise_key=str(row["exercise_key"]),
+            weight=float(row["weight"]),
+            logged_at=datetime.fromisoformat(str(row["logged_at"])),
+        )
+
+    def get_personal_records(self, chat_id: int) -> List[PersonalRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT exercise_key, MAX(weight) AS weight, MAX(logged_at) AS logged_at
+                FROM exercise_records
+                WHERE chat_id = ?
+                GROUP BY exercise_key
+                ORDER BY exercise_key
+                """,
+                (chat_id,),
+            ).fetchall()
+
+        return [
+            PersonalRecord(
+                exercise_key=str(row["exercise_key"]),
+                weight=float(row["weight"]),
+                logged_at=datetime.fromisoformat(str(row["logged_at"])),
+            )
+            for row in rows
+        ]
 
     def was_report_sent(self, chat_id: int, report_date: date) -> bool:
         with self._connect() as connection:
